@@ -220,6 +220,63 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   assert.equal(second.state.calls, 1, "only the edited call re-runs");
 });
 
+const threeCallScript = `export const meta = { name: 'prefix', description: 'prefix resume' }
+const a = await agent('A', { label: 'a' })
+const b = await agent('B', { label: 'b' })
+const c = await agent('C', { label: 'c' })
+return { a, b, c }`;
+
+test("resume re-runs the changed call AND everything after it (longest-unchanged-prefix)", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(threeCallScript, {
+    agent: first.runner,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 3);
+
+  // Edit the MIDDLE call (index 1). Index 0 is an unchanged prefix → cache hit.
+  // Index 1 changed → re-run; index 2 is unchanged but AFTER the first miss, so
+  // it must re-run too (the bug was serving it stale from the journal).
+  const editedScript = threeCallScript.replace("'B'", "'B-edited'");
+  const second = countingAgent();
+  await runWorkflow(editedScript, {
+    agent: second.runner,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+  });
+  assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
+});
+
+test("resume in parallel(): editing one thunk re-runs that index and every later one", async () => {
+  // Three identical-prompt thunks; editing the middle one must invalidate it and
+  // the same-or-later index, not just the single changed call.
+  const script = (mid: string) => `export const meta = { name: 'par_prefix', description: 'parallel prefix' }
+  const xs = await parallel([
+    () => agent('x', { label: 'p0' }),
+    () => agent('${mid}', { label: 'p1' }),
+    () => agent('x', { label: 'p2' }),
+  ])
+  return xs`;
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script("x"), {
+    agent: first.runner,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 3);
+
+  const second = countingAgent();
+  await runWorkflow(script("x-edited"), {
+    agent: second.runner,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+  });
+  assert.equal(second.state.calls, 2, "changed thunk (index 1) + later index (2) re-run; index 0 cached");
+});
+
 test("callSeq is deterministic under parallel()", async () => {
   const journal: JournalEntry[] = [];
   const script = `export const meta = { name: 'par', description: 'parallel order' }

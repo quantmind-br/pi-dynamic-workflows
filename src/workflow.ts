@@ -151,6 +151,12 @@ interface RuntimeState {
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
   callSeq: number;
+  /**
+   * Index of the first call that missed the resume journal (changed or new).
+   * Longest-unchanged-prefix resume: a cached result is replayed only while
+   * callIndex < firstMiss; once a call misses, it AND everything after run live.
+   */
+  firstMiss: number;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -190,6 +196,7 @@ export async function runWorkflow<T = unknown>(
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
     callSeq: 0,
+    firstMiss: Number.POSITIVE_INFINITY,
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -275,16 +282,23 @@ export async function runWorkflow<T = unknown>(
     const callIndex = state.callSeq++;
     const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
 
-    // Resume: replay a cached result for an unchanged call (matching hash), without
-    // consuming a concurrency slot, tokens, or a real subagent run.
+    // Longest-unchanged-prefix resume: replay a cached result only while the
+    // prefix is still intact — this call's index is before the first changed/new
+    // call. Once any call misses, it AND everything after it run live (matching
+    // Claude Code's contract), so an edited upstream call never leaves stale
+    // downstream results served from the journal.
     const cached = options.resumeJournal?.get(callIndex);
-    if (cached && cached.hash === callHash) {
+    const hashMatches = cached != null && cached.hash === callHash;
+    if (hashMatches && callIndex < state.firstMiss) {
       shared.agentCount++;
       const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
       return cached.result;
     }
+    // A genuine miss (no journal entry, or the hash changed) marks where the
+    // unchanged prefix ends; this call and every later one then run live.
+    if (!hashMatches) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
       shared.agentCount++;
