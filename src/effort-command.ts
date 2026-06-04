@@ -64,4 +64,24 @@ export function registerEffortCommand(pi: ExtensionAPI, state: EffortState): voi
       await say(`Effort is currently "${state.level}". Usage: /effort off | high | ultra`);
     },
   });
+
+  // `/ultracode` — the headline name for the maximal-effort mode (Pi's ultracode):
+  // `/ultracode` turns it on, `/ultracode off` turns it off. Alias for /effort ultra.
+  pi.registerCommand("ultracode", {
+    description:
+      "Ultracode: standing maximal-effort mode — auto-arms an exhaustive workflow for substantive messages. /ultracode off to stop.",
+    async handler(args: string, _ctx: ExtensionCommandContext) {
+      const arg = args.trim().toLowerCase();
+      const say = (content: string) => pi.sendMessage({ customType: "effort", content, display: true });
+      if (arg === "off") {
+        state.level = "off";
+        await say("Ultracode off — messages are no longer auto-armed as workflows.");
+        return;
+      }
+      state.level = "ultra";
+      await say(
+        "Ultracode ON — substantive messages now auto-arm an exhaustive workflow (wide fan-out, big-tier synthesis). Use /ultracode off to stop.",
+      );
+    },
+  });
 }

@@ -73,6 +73,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
+- **Ultracode** — `/ultracode` is a standing opt-in that auto-arms an exhaustive multi-agent workflow for every substantive message, the way Claude Code's ultracode does. `/effort high` is the lighter tier.
 - **Bundled `/deep-research` + `/adversarial-review`** — real web search, source cross-checking, and cited reports.
 - **Saved & nested workflows** — turn any run into a `/<name>` command, and compose saved workflows from inside other scripts.
 
@@ -88,6 +89,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 | Background runs | Non-blocking by default, a live task panel, and auto-continue delivery |
 | Resume | **Journaled + replayable** — survives restarts and replays the unchanged prefix |
 | Model selection | **Per-agent / per-phase routing** across any provider Pi is authenticated for |
+| Ultracode (standing maximal-effort opt-in) | **`/ultracode`** (or `/effort ultra`) — auto-arms an exhaustive workflow for every substantive message |
 | — | **Git worktree isolation**, **real cost accounting**, **`/deep-research`**, and a **quality-pattern stdlib** |
 
 ## Commands
@@ -98,7 +100,8 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows save <name>      save the latest run's script as a reusable /<name> command
 /workflows pause|resume|stop|rm <id>
 /workflows-models           map the small / medium / big tiers to real models
-/effort off|high|ultra      standing opt-in: auto-arm a workflow for substantive messages
+/ultracode [off]            ultracode: auto-arm an exhaustive workflow for every substantive message
+/effort off|high|ultra      finer control over the standing opt-in (high = thorough, ultra = ultracode)
 
 /deep-research <question>   web-researched, source-cross-checked report
 /adversarial-review <task>  findings vetted by skeptical reviewers

@@ -25,27 +25,43 @@ test("buildForcedWorkflowPrompt appends the extra directive only when provided",
   assert.ok(ultra.startsWith("do X"));
 });
 
-test("registerEffortCommand toggles the shared state via its handler", async () => {
-  const state = createEffortState();
-  let def: { handler: (a: string, c: unknown) => Promise<void> } | undefined;
+type CmdDef = { handler: (a: string, c: unknown) => Promise<void> };
+
+function registerAndCapture(state: ReturnType<typeof createEffortState>) {
+  const cmds = new Map<string, CmdDef>();
   const pi = {
-    registerCommand: (_name: string, d: unknown) => {
-      def = d as typeof def;
-    },
+    registerCommand: (name: string, d: unknown) => cmds.set(name, d as CmdDef),
     sendMessage: () => {},
   };
   registerEffortCommand(pi as never, state);
+  return cmds;
+}
+
+test("registerEffortCommand: /effort toggles the shared state", async () => {
+  const state = createEffortState();
+  const effort = registerAndCapture(state).get("effort");
+  assert.ok(effort, "/effort registered");
   assert.equal(state.level, "off");
 
-  await def?.handler("ultra", {});
+  await effort?.handler("ultra", {});
   assert.equal(state.level, "ultra");
-
-  await def?.handler("high", {});
+  await effort?.handler("high", {});
   assert.equal(state.level, "high");
-
-  await def?.handler("off", {});
+  await effort?.handler("off", {});
   assert.equal(state.level, "off");
-
-  await def?.handler("bogus", {});
+  await effort?.handler("bogus", {});
   assert.equal(state.level, "off", "unknown arg leaves the level unchanged");
+});
+
+test("registerEffortCommand: /ultracode turns ultra on, /ultracode off turns it off", async () => {
+  const state = createEffortState();
+  const ultracode = registerAndCapture(state).get("ultracode");
+  assert.ok(ultracode, "/ultracode registered");
+
+  await ultracode?.handler("", {});
+  assert.equal(state.level, "ultra", "/ultracode (no arg) sets ultra");
+  await ultracode?.handler("off", {});
+  assert.equal(state.level, "off", "/ultracode off turns it off");
+  await ultracode?.handler("anything", {});
+  assert.equal(state.level, "ultra", "/ultracode <anything-but-off> sets ultra");
 });
