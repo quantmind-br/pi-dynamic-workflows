@@ -156,9 +156,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     prepareArguments(args) {
       return normalizeWorkflowToolArgs(args);
     },
-    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const script = normalizeWorkflowScript(params.script);
       const parsed = parseWorkflowScript(script);
+
+      // checkpoint() reaches the human only on a UI-bearing foreground run; a
+      // background run is detached, so checkpoint() falls back to its headless
+      // default. Map a checkpoint to ctx.ui.confirm (a yes/no gate) when available.
+      const uiCtx = ctx as
+        | { hasUI?: boolean; ui?: { confirm?(title: string, message: string): Promise<boolean> } }
+        | undefined;
+      const uiConfirm = uiCtx?.hasUI ? uiCtx.ui?.confirm : undefined;
+      const confirm = uiConfirm
+        ? (promptText: string) => uiConfirm.call(uiCtx?.ui, "Workflow checkpoint", promptText)
+        : undefined;
 
       // Background execution is the default: return immediately so the turn ends
       // and the user isn't blocked. The result is delivered back into the
@@ -194,6 +205,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           maxAgents: params.maxAgents,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          confirm,
           externalSignal: signal,
           onProgress(live) {
             snapshot = recomputeWorkflowSnapshot(live);

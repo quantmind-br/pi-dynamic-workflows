@@ -51,6 +51,8 @@ export interface ExecOptions {
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
   tokenBudget?: number | null;
+  /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
+  confirm?: (promptText: string, options: unknown) => Promise<unknown>;
 }
 
 export interface WorkflowManagerOptions {
@@ -229,7 +231,7 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
-    const { resumeJournal, maxAgents, agentTimeoutMs, externalSignal, onProgress, tokenBudget } = exec;
+    const { resumeJournal, maxAgents, agentTimeoutMs, externalSignal, onProgress, tokenBudget, confirm } = exec;
     const progress = () => onProgress?.(managed.snapshot);
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
@@ -247,6 +249,7 @@ export class WorkflowManager extends EventEmitter {
         maxAgents,
         agentTimeoutMs,
         tokenBudget,
+        confirm,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
