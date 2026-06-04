@@ -92,3 +92,39 @@ return await completenessCheck({ task: 1 }, [{ done: true }])`;
   assert.equal(res.result.complete, false);
   assert.deepEqual([...res.result.missing], ["x"]);
 });
+
+test("retry(): stops when until() is satisfied, else returns the last after exhausting", async () => {
+  const script = `export const meta = { name: 'r', description: 'retry' }
+let n = 0
+const ok = await retry(() => { n++; return n }, { until: (r) => r >= 2, attempts: 5 })
+let m = 0
+const ex = await retry(() => { m++; return m }, { until: (r) => r > 99, attempts: 3 })
+return { ok, n, ex, m }`;
+  const res = await runWorkflow<{ ok: number; n: number; ex: number; m: number }>(script, {
+    agent: yesAgent,
+    persistLogs: false,
+  });
+  assert.equal(res.result.ok, 2, "stopped as soon as until() held");
+  assert.equal(res.result.n, 2);
+  assert.equal(res.result.ex, 3, "returned the last result after exhausting attempts");
+  assert.equal(res.result.m, 3);
+});
+
+test("gate(): passes the validator and feeds feedback into the next attempt", async () => {
+  const script = `export const meta = { name: 'g', description: 'gate' }
+const seen = []
+const res = await gate(
+  (feedback, i) => { seen.push(feedback ?? 'none'); return i },
+  (r) => (r >= 1 ? { ok: true } : { ok: false, feedback: 'try higher' }),
+  { attempts: 3 },
+)
+return { ok: res.ok, value: res.value, attempts: res.attempts, seen }`;
+  const res = await runWorkflow<{ ok: boolean; value: number; attempts: number; seen: string[] }>(script, {
+    agent: yesAgent,
+    persistLogs: false,
+  });
+  assert.equal(res.result.ok, true);
+  assert.equal(res.result.value, 1);
+  assert.equal(res.result.attempts, 2);
+  assert.deepEqual([...res.result.seen], ["none", "try higher"], "validator feedback is fed into the next attempt");
+});

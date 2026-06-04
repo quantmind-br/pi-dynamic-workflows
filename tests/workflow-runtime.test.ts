@@ -402,6 +402,25 @@ return xs`;
   );
 });
 
+test("phase sub-budget throws when a phase exceeds its ceiling (run total untouched)", async () => {
+  const script = `export const meta = { name: 'pb', description: 'phase budget' }
+phase('noisy', { budget: 100 })
+let blocked = false
+try {
+  await agent('a', { label: '1' })
+  await agent('b', { label: '2' })
+} catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+phase('calm')
+const after = await agent('c', { label: '3' })
+return { blocked, after }`;
+  const res = await runWorkflow<{ blocked: boolean; after: unknown }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    persistLogs: false,
+  });
+  assert.equal(res.result.blocked, true, "the 2nd agent in the phase hit the sub-budget");
+  assert.ok(res.result.after !== null, "a later phase still proceeds");
+});
+
 test("maxAgents is enforced under a parallel() fan-out (atomic slot reservation)", async () => {
   // Four agents fan out with maxAgents=2. With the synchronous slot reservation,
   // the 3rd agent() throws AGENT_LIMIT instead of all four passing the gate.

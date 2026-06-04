@@ -158,6 +158,14 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
 
 interface RuntimeState {
   currentPhase?: string;
+  /**
+   * Per-phase soft sub-budgets carved from the run total: phase title -> the
+   * ceiling and the run-wide spent at the moment the budget was declared. A phase
+   * exceeding its ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall
+   * budget is untouched. Soft gate (like the global one): spent accrues after each
+   * agent, so an in-flight wave may overshoot slightly.
+   */
+  phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
   logs: string[];
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
@@ -239,6 +247,7 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
+    phaseBudgets: new Map(),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -264,9 +273,15 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
-  const phase = (title: string) => {
+  const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
+    // Carve a soft sub-budget from the run total for work done under this phase.
+    // Re-declaring re-bases from the current spent (idempotent across resume: the
+    // script re-runs phase() and the ceiling is recomputed from live spent).
+    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
+      state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+    }
     options.onPhase?.(title);
   };
 
@@ -301,6 +316,29 @@ export async function runWorkflow<T = unknown>(
     }
 
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
+
+    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
+    // without touching the run's overall budget. Soft (spent accrues post-agent),
+    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
+    // work so later phases still proceed.
+    if (assignedPhase) {
+      const pb = state.phaseBudgets.get(assignedPhase);
+      if (pb) {
+        const phaseSpent = shared.spent - pb.startSpent;
+        if (phaseSpent >= pb.budget) {
+          throw new WorkflowError(
+            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+            { recoverable: false },
+          );
+        }
+        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
+          pb.warned = true;
+          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        }
+      }
+    }
+
     const requestedLabel = agentOptions.label?.trim();
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
@@ -640,6 +678,40 @@ export async function runWorkflow<T = unknown>(
       { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
     );
 
+  // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
+  // agent() pattern, but each attempt is a real agent() call so it auto-journals
+  // under a stable callSeq (resume-safe). No backoff: there is no timer in the vm
+  // and a delay has no resume value. NOTE: attempt N+1's call hash depends on N's
+  // live result, so a retry/gate chain cache-miss-cascades on resume (correct).
+  const retry = async (
+    thunk: (attempt: number) => Promise<unknown> | unknown,
+    opts: { attempts?: number; until?: (r: unknown) => boolean } = {},
+  ) => {
+    const attempts = Math.max(1, opts.attempts ?? 3);
+    let last: unknown;
+    for (let i = 0; i < attempts; i++) {
+      last = await thunk(i);
+      if (!opts.until || opts.until(last)) return last;
+    }
+    return last; // attempts exhausted — return the last result (caller inspects it)
+  };
+  const gate = async (
+    thunk: (feedback: string | undefined, attempt: number) => Promise<unknown> | unknown,
+    validator: (r: unknown) => Promise<{ ok: boolean; feedback?: string }> | { ok: boolean; feedback?: string },
+    opts: { attempts?: number } = {},
+  ) => {
+    const attempts = Math.max(1, opts.attempts ?? 3);
+    let feedback: string | undefined;
+    let last: unknown;
+    for (let i = 0; i < attempts; i++) {
+      last = await thunk(feedback, i);
+      const verdict = await validator(last);
+      if (verdict?.ok) return { ok: true, value: last, attempts: i + 1 };
+      feedback = verdict?.feedback; // fed into the next attempt
+    }
+    return { ok: false, value: last, attempts };
+  };
+
   const context = vm.createContext({
     agent,
     parallel,
@@ -649,6 +721,8 @@ export async function runWorkflow<T = unknown>(
     judgePanel,
     loopUntilDry,
     completenessCheck,
+    retry,
+    gate,
     log,
     phase,
     args: options.args,
