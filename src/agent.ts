@@ -19,10 +19,16 @@ import { createStructuredOutputTool, type StructuredOutputCapture } from "./stru
 /**
  * Resolve which concrete model spec a subagent should use. Precedence, most
  * specific first:
- *   1. options.model — an explicit per-agent model always wins.
+ *   1. options.model — an explicit per-agent model (also carries agentType /
+ *      phase model, which the workflow layer folds into options.model).
  *   2. options.tier  — resolved via the model-tiers config, falling back to the
  *      session's main model when the tier has no configured entry.
- * Returns undefined when neither is set, so the session default applies.
+ *   3. DEFAULT TIER — when neither is set but the user has a model-tiers config,
+ *      untagged agents default to the "medium" tier so a configured tier set
+ *      actually affects the whole workflow (not just agents the script tagged).
+ *      Fresh-install medium == the session model, so this is a no-op until the
+ *      user customizes tiers via /workflows-models.
+ * Returns undefined when nothing applies, so the session default is used.
  *
  * `loadConfig` is injectable for testing; it defaults to reading from disk.
  */
@@ -32,9 +38,14 @@ export function resolveAgentModelSpec(
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
 ): string | undefined {
   if (options.model) return options.model;
+  const config = loadConfig();
   if (options.tier) {
-    const config = loadConfig();
     return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
+  }
+  // Untagged agent: default to the configured medium tier when one exists.
+  if (config) {
+    const medium = resolveTierModel("medium", config);
+    if (medium) return medium;
   }
   return undefined;
 }

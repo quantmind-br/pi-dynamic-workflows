@@ -29,11 +29,12 @@ export function modelRoutingGuideline(): string {
     ? `The user's currently available models (route only to these) are: ${available.join(", ")}.`
     : "Use models the user has configured.";
   return [
-    "For workflow, decide each agent's model via opts.model or opts.tier.",
+    "For workflow, the user configures per-tier models (/workflows-models), so TAG EVERY agent with opts.tier by role so those models are actually used.",
     "opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime.",
     "Small tier: lightweight exploration/search/inventory agents.",
-    "Medium tier: balanced analysis agents (default when omitted).",
+    "Medium tier: balanced analysis agents.",
     "Big tier: synthesis/judgment/decision agents spanning the full context.",
+    "An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit.",
     "If the user named a specific model, use opts.model with that exact provider/id; opts.model always takes precedence over opts.tier.",
     list,
   ].join(" ");

@@ -159,7 +159,9 @@ return { inventory, summary }
 | `isolation` | `"worktree"` | Run this agent in its own throwaway git worktree (parallel edits without conflict) |
 | `timeoutMs` | number | Override the default 5-minute agent timeout |
 
-Models can also be set per phase via `meta.phases[].model`. Precedence: `opts.model` > `agentType` model > `opts.tier` > phase model > session default; an unknown model logs a warning and falls back. An explicit `model` always wins. The model each agent ran on is recorded and shown in the `/workflows` navigator.
+Models can also be set per phase via `meta.phases[].model`. Precedence: `opts.model` > `agentType` model > `opts.tier` > phase model > **configured `medium` tier (default for untagged agents)** > session default; an unknown model logs a warning and falls back. An explicit `model` always wins. The model each agent ran on is recorded and shown in the `/workflows` navigator.
+
+Once you've configured tiers (`/workflows-models`), an agent with **no** `model`/`tier` defaults to your **medium** tier — so a tier config affects the whole workflow, not only the agents the script tagged. (On a fresh install all three tiers equal your session model, so this is a no-op until you customize them.) Tag agents with `opts.tier` by role (`small` for exploration, `big` for synthesis) so `small`/`big` are actually used.
 
 **Subagent definitions (`agentType`)** make roles reusable. Drop a Markdown file at `.pi/agents/<name>.md` (project, takes precedence) or `~/.pi/agents/<name>.md` (user):
 
