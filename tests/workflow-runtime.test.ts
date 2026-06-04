@@ -599,3 +599,76 @@ return 1`;
 
   assert.ok(Array.isArray(result.logs), "result.logs should be an array");
 });
+
+// ─── Runtime determinism hardening (P0-5) ───────────────────────────────────────
+
+const noopAgent = {
+  async run() {
+    return "ok";
+  },
+};
+
+function probe(expr: string): Promise<{ result: { err: string | null; val: unknown } }> {
+  const script = `export const meta = { name: 'det', description: 'determinism' }
+let err = null, val = null
+try { val = ${expr} } catch (e) { err = String((e && e.message) || e) }
+await agent('noop', { label: 'x' })
+return { err, val }`;
+  return runWorkflow(script, { agent: noopAgent, persistLogs: false });
+}
+
+test("parse-time guard rejects literal Date.now / Math.random / new Date()", async () => {
+  for (const expr of ["Math.random()", "Date.now()", "new Date()"]) {
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'lit', description: 'd' }\nconst v = ${expr}\nawait agent('x', { label: 'x' })\nreturn v`,
+          { agent: noopAgent, persistLogs: false },
+        ),
+      /deterministic|unavailable/i,
+      `${expr} literal should be rejected at parse time`,
+    );
+  }
+});
+
+test("runtime guard neuters computed-access bypasses the parse regex misses", async () => {
+  const r1 = await probe('Math["random"]()');
+  assert.match(r1.result.err ?? "", /unavailable|resume/i, 'Math["random"]() should throw at runtime');
+  const r2 = await probe('Date["now"]()');
+  assert.match(r2.result.err ?? "", /unavailable|resume/i, 'Date["now"]() should throw at runtime');
+  const r3 = await probe("(() => { const D = Date; return new D(); })()");
+  assert.match(r3.result.err ?? "", /unavailable|resume/i, "aliased no-arg Date should throw at runtime");
+});
+
+test("runtime determinism: new Date(arg) and Math.max still work", async () => {
+  const d = await probe("new Date(0).getTime()");
+  assert.equal(d.result.err, null, "new Date(0) should construct");
+  assert.equal(d.result.val, 0, "new Date(0).getTime() === 0");
+  const m = await probe("Math.max(1, 2, 3)");
+  assert.equal(m.result.err, null);
+  assert.equal(m.result.val, 3);
+});
+
+test("vm-realm builtins work and the constructor escape hits the neutered Date.now", async () => {
+  // The escape string is split so the parse-time regex doesn't flag it; at runtime
+  // the vm Function runs in the vm realm where Date.now is neutered.
+  const script = `export const meta = { name: 'vm', description: 'vm realm' }
+let escaped = null
+try { escaped = ({}).constructor.constructor('return Da' + 'te.now()')() } catch (e) { escaped = 'blocked:' + String((e && e.message) || e) }
+const arr = [1, 2, 3].map((x) => x * 2)
+const j = JSON.stringify({ a: 1 })
+const s = [...new Set([1, 1, 2])]
+await agent('noop', { label: 'x' })
+return { escaped, arr, j, s }`;
+  const r = await runWorkflow<{ escaped: string; arr: number[]; j: string; s: number[] }>(script, {
+    agent: noopAgent,
+    persistLogs: false,
+  });
+  // Spread to a host array: vm-realm arrays don't deepStrictEqual host literals.
+  assert.deepEqual([...r.result.arr], [2, 4, 6], "vm Array.map works");
+  assert.equal(r.result.j, '{"a":1}', "vm JSON works");
+  assert.deepEqual([...r.result.s], [1, 2], "vm Set works");
+  // ({}).constructor.constructor is the vm Function; its code runs in the vm realm
+  // where Date.now is neutered -> blocked (the old host-object escape is closed).
+  assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
+});

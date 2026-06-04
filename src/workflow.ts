@@ -161,7 +161,40 @@ interface RuntimeState {
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
+// Parse-time author hint (fast feedback). The real enforcement is DETERMINISM_PRELUDE.
 const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\s+Date\s*\(\s*\)/;
+
+/**
+ * Runtime determinism hardening, run inside the vm realm BEFORE the user script.
+ * It neuters the nondeterministic builtins that would break resume (they'd make a
+ * re-run produce different values than the cached journal):
+ *   - Math.random()        -> throws
+ *   - Date.now()           -> throws
+ *   - Date() / new Date()  -> throws (no-arg); new Date(arg) still works
+ * Using the vm realm's own Math/Date/Reflect (not host objects) means this adds
+ * no host-`Function` escape. Note: vm is not a security sandbox — an injected
+ * bridge function's `.constructor` is still the host Function, so a determined
+ * script could bypass this. The guard is best-effort against ACCIDENTAL
+ * nondeterminism from trusted (user / guided-LLM) scripts, not a security wall.
+ */
+const DETERMINISM_PRELUDE = [
+  '"use strict";',
+  'Math.random = () => { throw new Error("Math.random() is unavailable in a workflow (it breaks resume); pass randomness via args or vary by index"); };',
+  "{",
+  "  const RealDate = Date;",
+  '  const fail = (w) => { throw new Error(w + " is unavailable in a workflow (it breaks resume); pass a timestamp via args"); };',
+  "  const SafeDate = function (...a) {",
+  '    if (!new.target) fail("Date()");',
+  '    if (a.length === 0) fail("new Date()");',
+  "    return Reflect.construct(RealDate, a, SafeDate);",
+  "  };",
+  "  SafeDate.UTC = RealDate.UTC;",
+  "  SafeDate.parse = RealDate.parse;",
+  '  SafeDate.now = () => fail("Date.now()");',
+  "  SafeDate.prototype = RealDate.prototype;",
+  "  globalThis.Date = SafeDate;",
+  "}",
+].join("\n");
 
 export async function runWorkflow<T = unknown>(
   script: string,
@@ -487,19 +520,13 @@ export async function runWorkflow<T = unknown>(
       warn: (m: unknown) => log(`[warn] ${String(m)}`),
       error: (m: unknown) => log(`[error] ${String(m)}`),
     },
-    JSON,
-    Math,
-    Array,
-    Object,
-    String,
-    Number,
-    Boolean,
-    Set,
-    Map,
-    Promise,
+    // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
+    // itself — we deliberately do NOT inject host built-ins, whose .constructor
+    // would be the host Function (a determinism-guard bypass). Math/Date are
+    // neutered in-realm by DETERMINISM_PRELUDE below.
   });
 
-  const wrapped = `(async () => {\n${body}\n})()`;
+  const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
 
   // Persist logs
