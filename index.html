@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pi-dynamic-workflows - Production-ready dynamic workflows and subagents for Pi</title>
+  <meta name="description" content="Production-ready dynamic workflows for Pi: subagents, real model routing, journaled resume, git worktree isolation, background runs, live task panel, token and cost accounting, and deep research.">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://quintinshaw.github.io/pi-dynamic-workflows/">
+  <meta property="og:title" content="pi-dynamic-workflows">
+  <meta property="og:description" content="Production-ready dynamic workflows and subagents for Pi.">
+  <meta property="og:url" content="https://quintinshaw.github.io/pi-dynamic-workflows/">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f4ef;
+      --text: #171512;
+      --muted: #5f5a52;
+      --line: #d8d0c4;
+      --accent: #0f766e;
+      --panel: #fffaf2;
+      --code: #102a2b;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111315;
+        --text: #f3eee7;
+        --muted: #b8b1a8;
+        --line: #32363a;
+        --accent: #2dd4bf;
+        --panel: #181b1e;
+        --code: #ddfff9;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(920px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 72px 0 56px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2.35rem, 7vw, 4.9rem);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      max-width: 760px;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: 1.2rem;
+    }
+
+    .install {
+      margin: 32px 0 0;
+      padding: 18px 20px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--code);
+      font: 600 1rem ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 28px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .links a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 42px;
+      padding: 9px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--text);
+      text-decoration: none;
+      background: color-mix(in srgb, var(--panel) 82%, transparent);
+    }
+
+    .links a:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    section {
+      margin-top: 48px;
+      padding-top: 30px;
+      border-top: 1px solid var(--line);
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      font-size: 1.35rem;
+    }
+
+    ul.features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .features li {
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    footer {
+      margin-top: 52px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+  </style>
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareSourceCode",
+      "name": "pi-dynamic-workflows",
+      "description": "Production-ready dynamic workflows and subagents for Pi.",
+      "codeRepository": "https://github.com/QuintinShaw/pi-dynamic-workflows",
+      "programmingLanguage": "TypeScript",
+      "runtimePlatform": "Pi",
+      "license": "https://opensource.org/licenses/MIT",
+      "url": "https://quintinshaw.github.io/pi-dynamic-workflows/",
+      "installUrl": "https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows"
+    }
+  </script>
+</head>
+<body>
+  <main>
+    <h1>pi-dynamic-workflows</h1>
+    <p class="lead">
+      Production-ready dynamic workflows and subagents for Pi. Write JavaScript orchestration code that fans work out across agents, resumes from a journal, isolates edits in git worktrees, and reports real token and cost usage.
+    </p>
+
+    <pre class="install">pi install npm:@quintinshaw/pi-dynamic-workflows</pre>
+
+    <ul class="links" aria-label="Project links">
+      <li><a href="https://github.com/QuintinShaw/pi-dynamic-workflows">GitHub repository</a></li>
+      <li><a href="https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows">npm package</a></li>
+      <li><a href="https://pi.dev/packages/%40quintinshaw/pi-dynamic-workflows">Pi package page</a></li>
+    </ul>
+
+    <section>
+      <h2>Built for real agent workflows</h2>
+      <ul class="features">
+        <li>Real per-agent and per-phase model routing.</li>
+        <li>Journaled resume for interrupted workflow runs.</li>
+        <li>Git worktree isolation for parallel code edits.</li>
+        <li>Background runs with a live task panel.</li>
+        <li>Real token and cost accounting from agent sessions.</li>
+        <li>Bundled deep research and adversarial review commands.</li>
+      </ul>
+    </section>
+
+    <footer>
+      Open-source extension for Pi dynamic workflows, subagents, workflow orchestration, and multi-agent coding.
+    </footer>
+  </main>
+</body>
+</html>
