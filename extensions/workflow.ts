@@ -32,13 +32,14 @@ export default function extension(pi: ExtensionAPI) {
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
   pi.registerTool(workflowTool);
-  registerWorkflowCommands(pi, manager, { storage, cwd });
+  // Standing /effort opt-in (off|high|ultra): auto-arms a workflow for substantive
+  // messages, like CC's ultracode. Shared with the editor's input hook below and
+  // with the explicit /workflows run <prompt> manual trigger.
+  const effort = createEffortState();
+  registerWorkflowCommands(pi, manager, { storage, cwd, effort });
   registerWorkflowModelsCommand(pi);
   registerBuiltinWorkflows(pi, { cwd });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
-  // Standing /effort opt-in (off|high|ultra): auto-arms a workflow for substantive
-  // messages, like CC's ultracode. Shared with the editor's input hook below.
-  const effort = createEffortState();
   registerEffortCommand(pi, effort);
   // "Workflows mode": type `workflow(s)` to arm a forced workflow (animated),
   // Backspace right after the word disarms it. Registers the `input` hook now;
