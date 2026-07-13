@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "test": "npm run check && npm run build && npm run test:unit",
-    "test:unit": "tsx --test tests/**/*.test.ts",
+    "test:unit": "tsx --experimental-test-module-mocks --test tests/**/*.test.ts",
     "check": "biome check .",
     "format": "biome format --write .",
     "lint": "biome lint .",

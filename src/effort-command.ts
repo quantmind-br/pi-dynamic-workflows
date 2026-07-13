@@ -1,18 +1,24 @@
 /**
  * Standing `/effort` opt-in (pi's answer to CC's ultracode): a session toggle that
  * auto-arms a workflow for substantive interactive messages, with effort-tier
- * guidance nudging fan-out breadth and the hard caps (tokenBudget / maxAgents) the
- * model should set on the workflow tool call.
+ * guidance nudging fan-out breadth (reviewers/judges, verify()/judgePanel(),
+ * loopUntilDry / completenessCheck, big-tier synthesis).
  *
  * Honest scope: the runtime cannot enforce "reviewer N / loop K" — those live in
- * the script the model writes — so the tiers are guidance plus the model setting
- * the real hard caps (tokenBudget/maxAgents are genuine runtime ceilings). The
- * pre-flight ceiling-confirm dialog (roadmap P1-5 #4) is a downscope point: an
- * `input` hook transforms synchronously and can't await a confirm, so it is left
- * to a follow-up; `/effort` is explicit opt-in, which is the safety valve.
+ * the script the model writes — so the tiers are guidance only. The pre-flight
+ * ceiling-confirm dialog (roadmap P1-5 #4) is a downscope point: an `input` hook
+ * transforms synchronously and can't await a confirm, so it is left to a
+ * follow-up; `/effort` is explicit opt-in, which is the safety valve.
+ *
+ * HIGH_DIRECTIVE / ULTRA_DIRECTIVE are the embedded default directive strings;
+ * users can override them via ~/.pi/workflows/prompts.json (see loadEffortPrompts).
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { EFFORT_PROMPTS_FILE } from "./config.js";
 
 export type EffortLevel = "off" | "high" | "ultra";
 
@@ -24,16 +30,47 @@ export function createEffortState(): EffortState {
   return { level: "off" };
 }
 
-const HIGH_DIRECTIVE =
-  "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()); set a moderate tokenBudget and maxAgents on the workflow tool call.";
-const ULTRA_DIRECTIVE =
-  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), and prefer the big tier for synthesis. This can spend a lot of tokens quickly, so set explicit caps you're comfortable paying for (a generous but bounded tokenBudget and a high maxAgents) on the workflow tool call rather than leaving them unbounded.";
+export const HIGH_DIRECTIVE =
+  "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()).";
+export const ULTRA_DIRECTIVE =
+  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), and prefer the big tier for synthesis.";
+
+export interface EffortPrompts {
+  high?: string;
+  ultra?: string;
+}
+
+/** Path to the effort directive prompts config file (~/.pi/workflows/prompts.json). */
+export function getEffortPromptsPath(): string {
+  return join(homedir(), EFFORT_PROMPTS_FILE);
+}
+
+/**
+ * Load user-customized effort directives. Missing, corrupt, or invalid files
+ * resolve to {} so callers fall back to HIGH_DIRECTIVE / ULTRA_DIRECTIVE.
+ * Only non-empty string entries for "high"/"ultra" are honored.
+ */
+export function loadEffortPrompts(promptsPath?: string): EffortPrompts {
+  const path = promptsPath ?? getEffortPromptsPath();
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: EffortPrompts = {};
+    if (typeof parsed.high === "string" && parsed.high.trim()) out.high = parsed.high;
+    if (typeof parsed.ultra === "string" && parsed.ultra.trim()) out.ultra = parsed.ultra;
+    return out;
+  } catch {
+    return {};
+  }
+}
 
 /** The extra directive appended to the forced-workflow prompt for an effort level. */
-export function effortDirective(level: EffortLevel): string | undefined {
-  if (level === "high") return HIGH_DIRECTIVE;
-  if (level === "ultra") return ULTRA_DIRECTIVE;
-  return undefined;
+export function effortDirective(level: EffortLevel, promptsPath?: string): string | undefined {
+  if (level === "off") return undefined;
+  const custom = loadEffortPrompts(promptsPath);
+  if (level === "high") return custom.high ?? HIGH_DIRECTIVE;
+  return custom.ultra ?? ULTRA_DIRECTIVE;
 }
 
 /**

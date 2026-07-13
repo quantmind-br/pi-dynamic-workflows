@@ -38,11 +38,23 @@ export class WorkflowError extends Error {
   readonly details?: unknown;
   /** For PROVIDER_USAGE_LIMIT: the provider's human reset hint, e.g. "Resets in ~3h" (verbatim). */
   readonly resetHint?: string;
+  /**
+   * For a PROVIDER_USAGE_LIMIT raised mid-turn: the file-backed partial session of
+   * the paused agent, so resume() can reopen it and continue the turn instead of
+   * restarting. Undefined when the agent ran on an in-memory session.
+   */
+  readonly partialSessionFile?: string;
 
   constructor(
     message: string,
     code: WorkflowErrorCode,
-    options: { recoverable?: boolean; agentLabel?: string; details?: unknown; resetHint?: string } = {},
+    options: {
+      recoverable?: boolean;
+      agentLabel?: string;
+      details?: unknown;
+      resetHint?: string;
+      partialSessionFile?: string;
+    } = {},
   ) {
     super(message);
     this.name = "WorkflowError";
@@ -51,6 +63,7 @@ export class WorkflowError extends Error {
     this.agentLabel = options.agentLabel;
     this.details = options.details;
     this.resetHint = options.resetHint;
+    this.partialSessionFile = options.partialSessionFile;
   }
 }
 
@@ -83,6 +96,24 @@ export function classifyProviderLimit(text: string | undefined): { matched: bool
   if (!matched) return { matched: false };
   const reset = text.match(/resets?\s+(?:in|at)\s+[^.\n]+/i);
   return { matched: true, resetHint: reset?.[0]?.trim() };
+}
+
+/**
+ * Parse the verbatim provider reset hint captured by classifyProviderLimit
+ * (e.g. "Resets in ~3h", "resets in 45m", "resets in 90 seconds") into a
+ * millisecond delay. Returns undefined when unparseable — including absolute
+ * "resets at <clock>" forms — so the caller falls back to backoff.
+ */
+export function parseResetHintMs(resetHint: string | undefined): number | undefined {
+  if (!resetHint) return undefined;
+  const m = resetHint.match(/~?\s*(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/i);
+  if (!m) return undefined;
+  const value = Number(m[1]);
+  if (!Number.isFinite(value) || value < 0) return undefined;
+  const unit = m[2].toLowerCase();
+  if (unit.startsWith("h")) return value * 3_600_000;
+  if (unit.startsWith("m")) return value * 60_000;
+  return value * 1_000; // seconds
 }
 
 export function isAbortError(error: unknown): boolean {

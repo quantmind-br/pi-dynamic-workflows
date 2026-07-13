@@ -33,6 +33,11 @@ export interface AgentDefinition {
   disallowedTools?: string[];
   /** Model spec (`provider/modelId` or bare id) for this subagent. */
   model?: string;
+  /**
+   * Ordered fallback model specs (each `provider/modelId` or bare id) tried, in
+   * order, when this subagent hits a PROVIDER_USAGE_LIMIT before the run pauses.
+   */
+  fallbackModels?: string[];
   /** Isolation mode. When "worktree", agents using this type run in a git worktree. */
   isolation?: "worktree";
   /** Markdown body, prepended to the subagent's task as role guidance. */
@@ -77,6 +82,7 @@ export function parseAgentDefinition(
     tools: toStringArray(fm.tools),
     disallowedTools: toStringArray(fm.disallowedTools),
     model: typeof fm.model === "string" ? fm.model.trim() || undefined : undefined,
+    fallbackModels: toStringArray(fm.fallbackModels),
     isolation:
       typeof fm.isolation === "string" && fm.isolation.toLowerCase().trim() === "worktree" ? "worktree" : undefined,
     prompt,
@@ -160,6 +166,7 @@ export function agentDefinitionKey(def: AgentDefinition | undefined): string | n
     tools: def.tools ?? null,
     disallowedTools: def.disallowedTools ?? null,
     model: def.model ?? null,
+    fallbackModels: def.fallbackModels ?? null,
     isolation: def.isolation ?? null,
     prompt: def.prompt,
   });

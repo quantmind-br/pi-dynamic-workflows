@@ -3,10 +3,13 @@
  */
 
 import { EventEmitter } from "node:events";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
+import { AUTO_RESUME_BASE_MS, AUTO_RESUME_MAX_ATTEMPTS, AUTO_RESUME_MAX_MS } from "./config.js";
 import { preview, type WorkflowSnapshot } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { parseResetHintMs, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
   generateRunId,
@@ -16,6 +19,7 @@ import {
   type RunStatus,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 export interface ManagedRun {
   runId: string;
@@ -39,6 +43,8 @@ export interface ManagedRun {
    * result, so re-delivering would duplicate it.
    */
   background: boolean;
+  /** Auto-resume attempts consumed by a usage-limit pause; reset to 0 on manual resume. */
+  resumeAttempts?: number;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -84,6 +90,11 @@ export interface WorkflowManagerOptions {
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /**
+   * Auto-resume a usage-limit-paused run after a cooldown. Enabled by default;
+   * values default to the AUTO_RESUME_* config constants.
+   */
+  autoResume?: { enabled?: boolean; maxAttempts?: number; baseMs?: number; maxMs?: number };
 }
 
 export class WorkflowManager extends EventEmitter {
@@ -101,6 +112,10 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+  /** Resolved auto-resume policy for usage-limit pauses. */
+  private autoResume: { enabled: boolean; maxAttempts: number; baseMs: number; maxMs: number };
+  /** Pending auto-resume timers by runId, so pause/stop/delete can cancel them. */
+  private autoResumeTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -113,8 +128,15 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.autoResume = {
+      enabled: options.autoResume?.enabled ?? true,
+      maxAttempts: options.autoResume?.maxAttempts ?? AUTO_RESUME_MAX_ATTEMPTS,
+      baseMs: options.autoResume?.baseMs ?? AUTO_RESUME_BASE_MS,
+      maxMs: options.autoResume?.maxMs ?? AUTO_RESUME_MAX_MS,
+    };
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
+    this.rearmAutoResumes();
   }
 
   /** Bind the manager to the current pi session, so new runs are tagged with it and
@@ -144,6 +166,72 @@ export class WorkflowManager extends EventEmitter {
       }
     } catch {
       // Recovery is best-effort; never let it block manager construction.
+    }
+  }
+
+  /**
+   * Schedule an automatic resume for a usage-limit-paused run after a cooldown.
+   * No-op unless enabled, paused, and paused on PROVIDER_USAGE_LIMIT with attempts
+   * left. Delay prefers the provider reset hint, else exponential backoff capped at
+   * maxMs, with ±20% jitter and a baseMs floor. The timer is unref'd so it never
+   * keeps the process alive, and is tracked so pause/stop/delete can cancel it.
+   */
+  private scheduleAutoResume(managed: Pick<ManagedRun, "runId" | "status" | "error" | "resumeAttempts">): void {
+    if (!this.autoResume.enabled) return;
+    if (managed.status !== "paused") return;
+    if (managed.error?.code !== WorkflowErrorCode.PROVIDER_USAGE_LIMIT) return;
+    const { runId } = managed;
+    const attempts = managed.resumeAttempts ?? 0;
+    if (attempts >= this.autoResume.maxAttempts) {
+      this.emit("autoResumeExhausted", { runId });
+      return;
+    }
+    const backoff = Math.min(this.autoResume.maxMs, this.autoResume.baseMs * 2 ** attempts);
+    const base = parseResetHintMs(managed.error?.resetHint) ?? backoff;
+    const jitter = base * (Math.random() * 0.4 - 0.2); // ±20%
+    const delay = Math.max(this.autoResume.baseMs, Math.round(base + jitter));
+    this.cancelAutoResume(runId);
+    const t = setTimeout(() => {
+      this.autoResumeTimers.delete(runId);
+      // The run may have been deleted/completed while the timer waited.
+      if (!this.runs.get(runId) && !this.persistence.load(runId)) return;
+      void this.resume(runId, { auto: true }).catch(() => false);
+    }, delay);
+    t.unref();
+    this.autoResumeTimers.set(runId, t);
+    this.emit("autoResumeScheduled", { runId, delay, attempt: attempts + 1 });
+  }
+
+  /** Cancel a pending auto-resume timer for a run, if any. */
+  private cancelAutoResume(runId: string): void {
+    const t = this.autoResumeTimers.get(runId);
+    if (t) {
+      clearTimeout(t);
+      this.autoResumeTimers.delete(runId);
+    }
+  }
+
+  /**
+   * On startup, re-arm auto-resume for any persisted run paused on a usage limit
+   * with attempts left, so a cold start still recovers after the provider refills.
+   * Best-effort, like recoverStaleRuns.
+   */
+  private rearmAutoResumes(): void {
+    try {
+      for (const p of this.listAllRuns()) {
+        if (p.status !== "paused" || p.pauseReason !== "usage_limit") continue;
+        if ((p.resumeAttempts ?? 0) >= this.autoResume.maxAttempts) continue;
+        this.scheduleAutoResume({
+          runId: p.runId,
+          status: "paused",
+          error: new WorkflowError(p.resetHint ?? "provider usage limit", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            resetHint: p.resetHint,
+          }),
+          resumeAttempts: p.resumeAttempts,
+        });
+      }
+    } catch {
+      // Best-effort; never block manager construction.
     }
   }
 
@@ -397,6 +485,9 @@ export class WorkflowManager extends EventEmitter {
       // Persist final state
       this.persistRun(managed);
       this.releaseRunLease(managed);
+      // The run finished: drop its subagent session-checkpoint dir (successful agents
+      // already deleted their own files; this clears any residue).
+      this.cleanupSessionDir(managed.runId);
 
       return result;
     } catch (error) {
@@ -439,6 +530,9 @@ export class WorkflowManager extends EventEmitter {
       // Persist final state
       this.persistRun(managed);
       this.releaseRunLease(managed);
+      // Arm auto-resume so the run recovers on its own once the provider refills
+      // (no-op when exhausted / not a usage-limit pause).
+      if (usageLimitPaused) this.scheduleAutoResume(managed);
 
       throw workflowError;
     }
@@ -448,6 +542,15 @@ export class WorkflowManager extends EventEmitter {
     if (!managed.lease) return;
     this.persistence.releaseRunLease(managed.lease);
     managed.lease = undefined;
+  }
+
+  /** Best-effort removal of a run's subagent session-checkpoint directory. */
+  private cleanupSessionDir(runId: string): void {
+    try {
+      rmSync(join(workflowProjectPaths(this.cwd).runsDir, `${runId}.sessions`), { recursive: true, force: true });
+    } catch {
+      // Best-effort: never let checkpoint cleanup fail a run or a delete.
+    }
   }
 
   private persistRun(managed: ManagedRun) {
@@ -472,6 +575,8 @@ export class WorkflowManager extends EventEmitter {
           managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
             ? managed.error.resetHint
             : undefined,
+        // Bounded auto-resume attempt count, carried across pause/resume + restart.
+        resumeAttempts: managed.resumeAttempts,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
         agents: managed.snapshot.agents.map((a) => ({
@@ -511,6 +616,7 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (managed?.status !== "running") return false;
 
+    this.cancelAutoResume(runId);
     managed.controller.abort();
     managed.status = "paused";
     this.emit("paused", { runId });
@@ -523,12 +629,15 @@ export class WorkflowManager extends EventEmitter {
    * Resume an interrupted run: replay journaled results for the unchanged prefix
    * and run the rest live. Returns false if there is nothing resumable.
    */
-  async resume(runId: string): Promise<boolean> {
+  async resume(runId: string, opts?: { auto?: boolean }): Promise<boolean> {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
     if (active?.status === "running") return false;
     if (active?.status === "aborted") return false;
+    // A manual resume supersedes any pending auto-resume timer; an auto-resume's
+    // own timer has already self-cleared before calling here.
+    this.cancelAutoResume(runId);
 
     const persisted = this.persistence.load(runId);
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
@@ -556,8 +665,13 @@ export class WorkflowManager extends EventEmitter {
       journal: persisted.journal ?? [],
       background: true,
       lease,
+      // Auto-resume increments the bounded counter; a manual resume resets it to 0
+      // (the user intervened, so give auto a fresh budget).
+      resumeAttempts: opts?.auto ? (persisted.resumeAttempts ?? 0) + 1 : 0,
     };
     this.runs.set(runId, managed);
+    // Persist the new attempt count before executing so a crash mid-resume keeps it.
+    this.persistRun(managed);
 
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     this.emit("resumed", { runId });
@@ -573,6 +687,7 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
 
+    this.cancelAutoResume(runId);
     managed.controller.abort();
     managed.status = "aborted";
     this.emit("stopped", { runId });
@@ -617,9 +732,11 @@ export class WorkflowManager extends EventEmitter {
    * Delete a persisted run.
    */
   deleteRun(runId: string): boolean {
+    this.cancelAutoResume(runId);
     const managed = this.runs.get(runId);
     if (managed) this.releaseRunLease(managed);
     this.runs.delete(runId);
+    this.cleanupSessionDir(runId);
     return this.persistence.delete(runId);
   }
 

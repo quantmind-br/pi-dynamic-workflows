@@ -11,6 +11,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
+import { fuzzyMatchModel } from "../src/workflows-models-command.js";
 
 async function loadCommand() {
   const mod = await import("../src/workflows-models-command.js");
@@ -117,5 +118,23 @@ describe("workflows-models-command", () => {
       assert.ok(result, "should return updated tiers");
       assert.equal(result.small, "openai/gpt-4.1-mini");
     });
+  });
+});
+
+describe("fuzzyMatchModel", () => {
+  it("empty query matches everything", () => {
+    assert.equal(fuzzyMatchModel("", "anything"), true);
+  });
+  it("matches a subsequence with gaps", () => {
+    assert.equal(fuzzyMatchModel("gp4", "openai/gpt-4.1-mini"), true);
+  });
+  it("is case-insensitive", () => {
+    assert.equal(fuzzyMatchModel("OPUS", "anthropic/claude-opus"), true);
+  });
+  it("returns false when a query char is absent", () => {
+    assert.equal(fuzzyMatchModel("zzz", "gpt-4"), false);
+  });
+  it("respects order (subsequence, not set membership)", () => {
+    assert.equal(fuzzyMatchModel("4gpt", "gpt-4"), false);
   });
 });

@@ -40,6 +40,8 @@ export interface PersistedRunState {
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
+  /** How many auto-resume attempts a usage-limit pause has consumed (bounded). */
+  resumeAttempts?: number;
   phases: string[];
   currentPhase?: string;
   agents: PersistedAgentState[];
@@ -57,8 +59,9 @@ export interface PersistedRunState {
     cacheRead?: number;
     cacheWrite?: number;
   };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
+  /** Cached agent results for resume, keyed by deterministic call index. A partial
+   * entry (interrupted turn) carries partialSessionFile instead of a result. */
+  journal?: Array<{ index: number; hash: string; result?: unknown; partialSessionFile?: string }>;
 }
 
 export interface RunPersistence {

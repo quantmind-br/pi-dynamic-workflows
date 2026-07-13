@@ -6,10 +6,12 @@
 export interface ModelRoute {
   /** Phase name pattern (regex or exact match). */
   phasePattern: string;
-  /** Model to use for this phase. */
-  model: string;
+  /** Model to use for this phase. Optional so a phase can supply only a fallback chain. */
+  model?: string;
   /** Whether to use regex matching. */
   useRegex?: boolean;
+  /** Fallback model chain for this phase, tried on PROVIDER_USAGE_LIMIT. */
+  fallbackModels?: string[];
 }
 
 export interface ModelRoutingConfig {
@@ -17,6 +19,8 @@ export interface ModelRoutingConfig {
   defaultModel?: string;
   /** Per-phase model overrides. */
   routes: ModelRoute[];
+  /** Run-level default fallback chain when a phase route has none. */
+  defaultFallbackModels?: string[];
 }
 
 /**
@@ -28,6 +32,7 @@ export function resolveModelForPhase(phase: string | undefined, config: ModelRou
   }
 
   for (const route of config.routes) {
+    if (!route.model) continue; // fallback-only route; can't provide a model
     if (route.useRegex) {
       try {
         const regex = new RegExp(route.phasePattern, "i");
@@ -49,25 +54,51 @@ export function resolveModelForPhase(phase: string | undefined, config: ModelRou
 }
 
 /**
+ * Resolve the fallback model chain for a given phase, mirroring resolveModelForPhase.
+ * Returns the matched route's fallbackModels, else the config default, else [].
+ */
+export function resolveFallbackModelsForPhase(phase: string | undefined, config: ModelRoutingConfig): string[] {
+  if (phase && config.routes.length) {
+    for (const route of config.routes) {
+      if (!route.fallbackModels?.length) continue;
+      if (route.useRegex) {
+        try {
+          if (new RegExp(route.phasePattern, "i").test(phase)) return route.fallbackModels;
+        } catch {
+          // Invalid regex, skip
+        }
+      } else if (phase === route.phasePattern) {
+        return route.fallbackModels;
+      }
+    }
+  }
+  return config.defaultFallbackModels ?? [];
+}
+
+/**
  * Parse model routing from workflow meta: per-phase models from meta.phases[].model
  * and a top-level default from meta.model (used when no phase route matches).
  */
 export function parseModelRoutingFromMeta(
-  phases?: Array<{ title: string; model?: string }>,
+  phases?: Array<{ title: string; model?: string; fallbackModels?: string[] }>,
   defaultModel?: string,
+  defaultFallbackModels?: string[],
 ): ModelRoutingConfig {
   const routes: ModelRoute[] = [];
 
   if (phases) {
     for (const phase of phases) {
-      if (phase.model) {
+      // A route carries a phase's model and/or its fallback chain. Push when either
+      // is present so a fallback-only phase still resolves its chain.
+      if (phase.model || phase.fallbackModels?.length) {
         routes.push({
           phasePattern: phase.title,
           model: phase.model,
+          fallbackModels: phase.fallbackModels,
         });
       }
     }
   }
 
-  return { defaultModel, routes };
+  return { defaultModel, routes, defaultFallbackModels };
 }

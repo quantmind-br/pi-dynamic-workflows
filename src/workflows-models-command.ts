@@ -105,6 +105,20 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
 }
 
 /**
+ * Fuzzy subsequence match (case-insensitive): every character of `query`
+ * appears in `spec` in order, gaps allowed. Empty query matches everything.
+ */
+export function fuzzyMatchModel(query: string, spec: string): boolean {
+  const q = query.toLowerCase();
+  const s = spec.toLowerCase();
+  let i = 0;
+  for (let j = 0; j < s.length && i < q.length; j++) {
+    if (s[j] === q[i]) i++;
+  }
+  return i === q.length;
+}
+
+/**
  * Interactive editor for a single tier — scrollable model picker.
  *
  * Uses `ctx.ui.custom()` with Pi TUI's `SelectList` for proper
@@ -129,14 +143,7 @@ export async function editSingleTier(
   const result = await ctx.ui.custom<string | null>((tui: TUI, theme: Theme, _keybindings, done) => {
     const container = new Container();
 
-    // Title showing current model
-    const titleText = current
-      ? `Pick a model for "${tierName}" (current: ${current})`
-      : `Pick a model for "${tierName}"`;
-    container.addChild(new Text(theme.fg("accent", titleText), 1, 0));
-    container.addChild(new Spacer(1));
-
-    // SelectList theme
+    // SelectList theme (shared across rebuilds)
     const selectTheme: SelectListTheme = {
       selectedPrefix: (t: string) => theme.bg("selectedBg", theme.fg("accent", t)),
       selectedText: (t: string) => theme.bg("selectedBg", theme.bold(t)),
@@ -145,27 +152,57 @@ export async function editSingleTier(
       noMatch: (t: string) => theme.fg("warning", t),
     };
 
-    const selectList = new SelectList(items, 12, selectTheme);
+    let filter = "";
 
-    // Preselect the current model
-    if (current) {
-      const idx = items.findIndex((i) => i.value === current);
-      if (idx >= 0) selectList.setSelectedIndex(idx);
-    }
+    // Rebuild the dialog children for the current filter and return the fresh list.
+    const rebuild = (): SelectList => {
+      container.clear();
 
-    // Wire up callbacks
-    selectList.onSelect = (item) => done(item.value);
-    selectList.onCancel = () => done(null);
+      const titleText = current
+        ? `Pick a model for "${tierName}" (current: ${current})`
+        : `Pick a model for "${tierName}"`;
+      container.addChild(new Text(theme.fg("accent", titleText), 1, 0));
+      container.addChild(new Text(theme.fg("muted", `filter: ${filter || "(type to filter)"}`), 1, 0));
+      container.addChild(new Spacer(1));
 
-    container.addChild(selectList);
-    container.addChild(new Spacer(1));
-    container.addChild(new Text(theme.fg("dim", "↑↓ navigate  enter select  esc cancel"), 1, 0));
+      const matched = filter ? items.filter((it) => fuzzyMatchModel(filter, it.value)) : items;
+      const list = new SelectList(matched, 12, selectTheme);
+
+      // Preselect the current model when present in the filtered set
+      if (current) {
+        const idx = matched.findIndex((it) => it.value === current);
+        if (idx >= 0) list.setSelectedIndex(idx);
+      }
+
+      list.onSelect = (item) => done(item.value);
+      list.onCancel = () => done(null);
+
+      container.addChild(list);
+      container.addChild(new Spacer(1));
+      container.addChild(
+        new Text(theme.fg("dim", "↑↓ navigate  type to filter  ⌫ delete  enter select  esc cancel"), 1, 0),
+      );
+
+      return list;
+    };
+
+    let selectList = rebuild();
 
     return {
       render: (w: number) => container.render(w),
       invalidate: () => container.invalidate(),
       handleInput: (data: string) => {
-        selectList.handleInput(data);
+        if (data === "\x7f" || data === "\x08") {
+          if (filter) {
+            filter = filter.slice(0, -1);
+            selectList = rebuild();
+          }
+        } else if (data.length > 0 && [...data].every((ch) => ch >= " " && ch !== "\x7f")) {
+          filter += data;
+          selectList = rebuild();
+        } else {
+          selectList.handleInput(data);
+        }
         tui.requestRender();
       },
     };

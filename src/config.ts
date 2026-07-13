@@ -32,6 +32,17 @@ export const MODEL_TIERS_FILE = ".pi/workflows/model-tiers.json";
 /** User-level workflow extension settings file, relative to the home directory. */
 export const WORKFLOW_SETTINGS_FILE = ".pi/workflows/settings.json";
 
+/** User-level effort directive prompts config file, relative to the home directory. */
+export const EFFORT_PROMPTS_FILE = ".pi/workflows/prompts.json";
+
+// Auto-resume after a provider usage-limit pause (no prior auto-resume config existed).
+/** Max auto-resume attempts before a usage-limit-paused run is left paused. */
+export const AUTO_RESUME_MAX_ATTEMPTS = 5;
+/** Base backoff before the first auto-resume attempt (doubles each attempt). */
+export const AUTO_RESUME_BASE_MS = 60_000;
+/** Cap on the auto-resume backoff delay (30 minutes). */
+export const AUTO_RESUME_MAX_MS = 1_800_000;
+
 /** Default keyword that arms workflows mode from interactive input. */
 export const DEFAULT_KEYWORD_TRIGGER_WORD = "workflow";
 

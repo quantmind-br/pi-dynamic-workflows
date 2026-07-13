@@ -29,15 +29,21 @@ export {
 export {
   createEffortState,
   type EffortLevel,
+  type EffortPrompts,
   type EffortState,
   effortDirective,
+  getEffortPromptsPath,
+  HIGH_DIRECTIVE,
   isSubstantive,
+  loadEffortPrompts,
   registerEffortCommand,
+  ULTRA_DIRECTIVE,
 } from "./effort-command.js";
 export {
   isAbortError,
   isTimeoutError,
   isWorkflowError,
+  parseResetHintMs,
   WorkflowError,
   WorkflowErrorCode,
   wrapError,
@@ -45,7 +51,7 @@ export {
 export type { WorkflowLogger, WorkflowLoggerOptions } from "./logger.js";
 export { createWorkflowLogger } from "./logger.js";
 export type { ModelRoute, ModelRoutingConfig } from "./model-routing.js";
-export { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+export { parseModelRoutingFromMeta, resolveFallbackModelsForPhase, resolveModelForPhase } from "./model-routing.js";
 export type { ModelTierConfig } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
@@ -126,4 +132,4 @@ export {
 } from "./workflow-ui.js";
 export { registerWorkflowModelsCommand } from "./workflows-models-command.js";
 export type { Worktree } from "./worktree.js";
-export { createWorktree, removeWorktree } from "./worktree.js";
+export { commitWorktree, createWorktree, mergeWorktree, removeWorktree } from "./worktree.js";

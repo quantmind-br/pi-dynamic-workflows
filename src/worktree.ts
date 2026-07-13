@@ -1,8 +1,11 @@
 /**
  * Per-agent git worktree isolation. When an agent requests `isolation: "worktree"`,
  * it runs in a throwaway worktree on its own branch so parallel agents can edit the
- * same files without conflict. Results are NOT auto-merged — the path is surfaced for
- * the caller to inspect. Falls back to a logged no-op when isolation isn't possible.
+ * same files without conflict. An isolated agent's edits are committed and merged back
+ * to the base branch ONLY on success (commitWorktree + mergeWorktree) — a saga: a
+ * partial/failed agent's branch is discarded untouched, so a resume re-run cannot
+ * double-apply. A merge conflict aborts the merge and keeps the branch/worktree for
+ * manual reconciliation. Falls back to a logged no-op when isolation isn't possible.
  */
 
 import { execFile } from "node:child_process";
@@ -58,19 +61,62 @@ export async function createWorktree(baseCwd: string, name: string): Promise<Wor
   }
 }
 
-/** Remove a worktree and its branch. Best-effort; safe to call on a no-op Worktree. */
-export async function removeWorktree(wt: Worktree): Promise<void> {
+/**
+ * Remove a worktree and (unless keepBranch) its branch. Best-effort; safe to call on
+ * a no-op Worktree. Pass keepBranch to drop the working dir but preserve the branch
+ * (e.g. to keep committed-but-unmerged work for manual reconciliation).
+ */
+export async function removeWorktree(wt: Worktree, opts?: { keepBranch?: boolean }): Promise<void> {
   if (!wt.isolated || !wt.repoRoot) return;
   try {
     await exec("git", ["-C", wt.repoRoot, "worktree", "remove", "--force", wt.cwd]);
   } catch {
     // already gone / locked — fall through
   }
-  if (wt.branch) {
+  if (wt.branch && !opts?.keepBranch) {
     try {
       await exec("git", ["-C", wt.repoRoot, "branch", "-D", wt.branch]);
     } catch {
       // branch already deleted
     }
+  }
+}
+
+/**
+ * Stage and commit all changes in an isolated worktree onto its branch. Returns true
+ * when a commit was made, false when there is nothing to commit, isolation is off, or
+ * any git step fails (best-effort — a commit failure never fails the agent).
+ */
+export async function commitWorktree(wt: Worktree, message: string): Promise<boolean> {
+  if (!wt.isolated) return false;
+  try {
+    await exec("git", ["-C", wt.cwd, "add", "-A"]);
+    const { stdout } = await exec("git", ["-C", wt.cwd, "status", "--porcelain"]);
+    if (!stdout.trim()) return false; // no changes → nothing to merge
+    await exec("git", ["-C", wt.cwd, "commit", "-q", "-m", message]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Merge an isolated worktree's committed branch back into the base repo's current
+ * branch with a merge commit. On conflict the merge is aborted (base tree left clean)
+ * and { conflict: true } is returned so the caller can keep the branch for manual
+ * reconciliation.
+ */
+export async function mergeWorktree(wt: Worktree): Promise<{ merged: boolean; conflict: boolean }> {
+  if (!wt.isolated || !wt.repoRoot || !wt.branch) return { merged: false, conflict: false };
+  try {
+    await exec("git", ["-C", wt.repoRoot, "merge", "--no-ff", "--no-edit", wt.branch]);
+    return { merged: true, conflict: false };
+  } catch {
+    try {
+      await exec("git", ["-C", wt.repoRoot, "merge", "--abort"]);
+    } catch {
+      // best-effort: nothing to abort, or already clean
+    }
+    return { merged: false, conflict: true };
   }
 }

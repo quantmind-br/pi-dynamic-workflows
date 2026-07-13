@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -16,14 +17,17 @@ import {
 import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
-import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { parseModelRoutingFromMeta, resolveFallbackModelsForPhase, resolveModelForPhase } from "./model-routing.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
-import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
+import { commitWorktree, createWorktree, mergeWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
   title: string;
   detail?: string;
   model?: string;
+  /** Default fallback model chain for agents in this phase (tried on PROVIDER_USAGE_LIMIT). */
+  fallbackModels?: string[];
 }
 
 export interface WorkflowMeta {
@@ -32,6 +36,8 @@ export interface WorkflowMeta {
   phases?: WorkflowMetaPhase[];
   /** Default model for agents whose phase has no route and that set no model/tier. */
   model?: string;
+  /** Run-level default fallback model chain (tried on PROVIDER_USAGE_LIMIT). */
+  fallbackModels?: string[];
 }
 
 /** One cached agent() result, keyed by its deterministic call index. */
@@ -39,7 +45,13 @@ export interface JournalEntry {
   index: number;
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
   hash: string;
-  result: unknown;
+  /** The cached result. Absent on a partial entry (see partialSessionFile). */
+  result?: unknown;
+  /**
+   * When the agent paused mid-turn on a PROVIDER_USAGE_LIMIT, the file-backed
+   * partial session to reopen on resume. A partial entry has this and no result.
+   */
+  partialSessionFile?: string;
   /**
    * Per-agent write delta (keys set by this agent) for additive replay on resume.
    * Replaces the former full-map snapshot to fix parallel-agent ordering: applying
@@ -60,6 +72,12 @@ export interface SharedRuntime {
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
+  /**
+   * Serialization point for worktree merges into the base repo: agents chain their
+   * `git merge` on this so only one touches the base working tree at a time, across
+   * concurrent agents and nested runs.
+   */
+  mergeChain: Promise<unknown>;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -163,6 +181,13 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    */
   model?: string;
   /**
+   * Ordered fallback model specs (each `provider/modelId` or bare id) for this
+   * agent, tried in order on a PROVIDER_USAGE_LIMIT before the run pauses.
+   * Precedence (first non-empty wins): this call-site value > agentType def >
+   * phase/run-level meta.fallbackModels. Does not enter the resume hash.
+   */
+  fallbackModels?: string[];
+  /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config (see /workflows-models). An explicit `model` takes
    * precedence; a tier takes precedence over the phase model. When the tier has
@@ -264,11 +289,15 @@ export async function runWorkflow<T = unknown>(
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
-  const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
+  const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model, meta.fallbackModels);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
+  // Directory for subagents' file-backed sessions (turn checkpoints). Colocated with
+  // the run's persisted JSON so the manager cleans it on completion/delete. A nested
+  // run keeps its own dir via its distinct runId.
+  const sessionsDir = join(workflowProjectPaths(baseCwd).runsDir, `${runId}.sessions`);
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it.
   const agentRegistry = options.agentRegistry ?? loadAgentRegistry(baseCwd);
@@ -305,8 +334,21 @@ export async function runWorkflow<T = unknown>(
     spent: 0,
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
+    mergeChain: Promise.resolve(),
   };
   const limiter = shared.limiter;
+
+  // Serialize worktree merges so only one `git merge` touches the base tree at a time,
+  // across concurrent agents and nested runs sharing this SharedRuntime.
+  const serializeMerge = <R>(fn: () => Promise<R>): Promise<R> => {
+    const next = shared.mergeChain.then(fn, fn);
+    // Keep the chain alive regardless of individual merge outcomes.
+    shared.mergeChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
@@ -403,6 +445,21 @@ export async function runWorkflow<T = unknown>(
     // spec, else the session's main model. The real resolved id overrides this via
     // onModelResolved once the subagent session is created.
     let displayModel = modelSpec ?? options.mainModel;
+    // Effective fallback chain (first non-empty wins, mirroring the model
+    // precedence above): call-site > agentType def > phase/run-level default.
+    // Deduped, and the resolved primary is dropped since it is the first attempt.
+    // NOT part of callHash — a fallback that swaps the executed model must not
+    // break resume (which keys on the primary modelSpec).
+    const rawFallback =
+      (agentOptions.fallbackModels?.length ? agentOptions.fallbackModels : undefined) ??
+      (agentDef?.fallbackModels?.length ? agentDef.fallbackModels : undefined) ??
+      resolveFallbackModelsForPhase(assignedPhase, routingConfig);
+    const seenFallback = new Set<string>();
+    const fallbackModels = rawFallback.filter((m) => {
+      if (!m || m === modelSpec || seenFallback.has(m)) return false;
+      seenFallback.add(m);
+      return true;
+    });
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
@@ -433,8 +490,13 @@ export async function runWorkflow<T = unknown>(
     // downstream results served from the journal.
     const cached = options.resumeJournal?.get(callIndex);
     const hashMatches = cached != null && cached.hash === callHash;
-    const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+    // A partial entry (paused mid-turn) is a resume point, not a replayable result:
+    // continue its interrupted turn from the persisted session instead of replaying.
+    const cachedPartial = hashMatches && cached.partialSessionFile != null && cached.result === undefined;
+    const cachedEmptyOutput =
+      hashMatches && !cachedPartial && isEmptyTextAgentResult(cached.result, agentOptions.schema);
+    let resumeSessionFile: string | undefined;
+    if (hashMatches && !cachedEmptyOutput && !cachedPartial && callIndex < state.firstMiss) {
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
       // Apply this agent's write delta so live agents later in the run see a
@@ -443,9 +505,11 @@ export async function runWorkflow<T = unknown>(
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
     }
-    // A genuine miss (no journal entry, or the hash changed) marks where the
+    // A partial checkpoint reopens its interrupted turn on the same call.
+    if (cachedPartial) resumeSessionFile = cached.partialSessionFile;
+    // A genuine miss (no entry, hash changed, or a partial checkpoint) marks where the
     // unchanged prefix ends; this call and every later one then run live.
-    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!hashMatches || cachedEmptyOutput || cachedPartial) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
@@ -460,6 +524,9 @@ export async function runWorkflow<T = unknown>(
       // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
       // or override with a def that has no isolation field if opt-out is needed.
       let worktree: Worktree | undefined;
+      // On a merge conflict the worktree + branch are kept for manual reconciliation
+      // (the finally then skips teardown).
+      let keepWorktree = false;
       const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
@@ -499,6 +566,7 @@ export async function runWorkflow<T = unknown>(
                 signal: options.signal,
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
+                fallbackModels,
                 tier: agentOptions.tier,
                 modelRegistry: options.modelRegistry,
                 toolNames: agentDef?.tools,
@@ -509,12 +577,18 @@ export async function runWorkflow<T = unknown>(
                 // this store concurrently with the parent run.
                 systemTools: createAgentStoreTools(store, deltaKey),
                 cwd: runCwd,
+                // File-backed session so an interrupted turn can be checkpointed;
+                // resumeSessionFile continues a partial turn instead of restarting.
+                sessionDir: sessionsDir,
+                resumeSessionFile,
                 onModelResolved: (id: string) => {
                   displayModel = id;
                 },
                 onModelFallback: (spec: string) => {
-                  // Make the silent degrade visible in /workflows, not just console.
-                  log(`${label}: model "${spec}" unavailable — using the session default`);
+                  // Fires when a requested model can't be resolved (→ session
+                  // default) and when the usage-limit fallback chain degrades to
+                  // another model. Surface either in /workflows, not just console.
+                  log(`${label}: model routing fell back (model "${spec}")`);
                 },
                 onUsage: (u: AgentUsage) => {
                   usage = u;
@@ -550,6 +624,23 @@ export async function runWorkflow<T = unknown>(
               worktree: runCwd,
               model: displayModel,
             });
+            // Isolated side-effecting agent = saga: commit the worktree only on
+            // success, then merge it back to base (serialized so one merge touches the
+            // base tree at a time). A conflict aborts the merge and keeps the
+            // branch/worktree for manual reconciliation — it never fails the agent.
+            if (worktree?.isolated) {
+              const wt = worktree;
+              const committed = await commitWorktree(wt, `pi/wf ${label} (${runId}:${callIndex})`);
+              if (committed) {
+                const { conflict } = await serializeMerge(() => mergeWorktree(wt));
+                if (conflict) {
+                  keepWorktree = true;
+                  log(
+                    `agent "${label}": worktree merge conflict — kept branch ${wt.branch} at ${wt.cwd} for manual merge`,
+                  );
+                }
+              }
+            }
             return result;
           } catch (error) {
             if (options.signal?.aborted) throw error;
@@ -583,13 +674,24 @@ export async function runWorkflow<T = unknown>(
               );
               return null;
             }
+            // A mid-turn usage-limit pause: persist the partial session ref (keyed by
+            // callIndex) so resume() reopens and continues this turn instead of
+            // restarting. The manager's onAgentJournal persists it.
+            if (workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT && workflowError.partialSessionFile) {
+              options.onAgentJournal?.({
+                index: callIndex,
+                hash: callHash,
+                partialSessionFile: workflowError.partialSessionFile,
+              });
+            }
             throw workflowError;
           }
         }
         return null;
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
-        if (worktree?.isolated) await removeWorktree(worktree);
+        // Tear down the worktree (discard branch) on failure/timeout/abort or after a
+        // successful merge; a merge conflict keeps dir+branch for manual reconciliation.
+        if (worktree?.isolated && !keepWorktree) await removeWorktree(worktree);
       }
     });
   };

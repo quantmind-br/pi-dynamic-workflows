@@ -1,3 +1,4 @@
+import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
@@ -15,7 +16,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
-import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { classifyProviderLimit, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 
@@ -261,6 +262,13 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   model?: string;
   /**
+   * Ordered fallback model specs (each `provider/modelId` or bare id). On a
+   * PROVIDER_USAGE_LIMIT the same prompt is retried on each in order before the
+   * limit propagates and the run pauses. Unresolvable specs are skipped (logged
+   * via onModelFallback), not counted as attempts. Does not enter the resume hash.
+   */
+  fallbackModels?: string[];
+  /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
@@ -307,6 +315,19 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * omitted.
    */
   modelRegistry?: ModelRegistry;
+  /**
+   * Directory for a file-backed session (turn checkpoint). When set, the subagent
+   * runs on a persisted SessionManager under this dir so an interrupted turn can be
+   * reopened on resume. When omitted, an in-memory session is used (default; keeps
+   * existing/test callers unchanged).
+   */
+  sessionDir?: string;
+  /**
+   * Path to a previously-persisted partial session. When set and the file exists,
+   * the session is reopened and the model is asked to continue the interrupted turn
+   * instead of restarting from the full prompt. Missing file → fresh full prompt.
+   */
+  resumeSessionFile?: string;
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -399,113 +420,205 @@ export class WorkflowAgent {
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
     const modelSpec = resolveAgentModelSpec(options, this.mainModel);
-
-    // Resolve a requested model spec to a Model object. A given-but-unresolved
-    // spec falls back to the session default (with a warning) rather than failing.
-    let resolvedModel: Model<any> | undefined;
-    if (modelSpec) {
-      resolvedModel = this.resolveModel(modelSpec, options.modelRegistry);
-      if (resolvedModel) {
-        options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
-      } else {
-        console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
-        options.onModelFallback?.(modelSpec);
-      }
-    }
-
     const agentDir = getAgentDir();
-    const { session } = await createAgentSession({
-      cwd: runCwd,
-      agentDir,
-      sessionManager: SessionManager.inMemory(),
-      // Use real SettingsManager to inherit user's default provider/model settings.
-      // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
-      // would fall back to the first available model (e.g. openai-codex) which may
-      // not have valid auth, causing silent empty responses.
-      settingsManager: SettingsManager.create(this.cwd, agentDir),
-      customTools,
-      // Per-run modelRegistry wins over the constructor's shared registry, same
-      // precedence as resolveModel() above.
-      ...(options.modelRegistry || this.sharedRegistry
-        ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
-        : {}),
-      ...this.sessionOptions,
-      // Per-call model wins over any sessionOptions.model.
-      ...(resolvedModel ? { model: resolvedModel } : {}),
-    });
 
-    let removeAbortListener: (() => void) | undefined;
-    let removeHistoryListener: (() => void) | undefined;
-    let lastHistoryEmit = 0;
-    const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
-    const maybeEmitHistory = () => {
-      if (!options.onHistory) return;
-      const now = Date.now();
-      if (now - lastHistoryEmit < 250) return;
-      lastHistoryEmit = now;
-      emitHistory();
-    };
-    try {
-      if (options.signal?.aborted) throw new Error("Subagent was aborted");
-      if (options.signal) {
-        const onAbort = () => void session.abort();
-        options.signal.addEventListener("abort", onAbort, { once: true });
-        removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
-      }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
-      }
-
-      await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
-
-      if (options.signal?.aborted) throw new Error("Subagent was aborted");
-
-      // The SDK buries a provider usage/quota limit in the assistant message rather
-      // than throwing; detect it here (before the schema/empty-text branches) so it
-      // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
-      // (schema path) or a silent empty-output null (non-schema path).
-      throwIfProviderLimit(session.messages, options.label);
-
-      if (options.schema) {
-        return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>
-          this.lastAssistantText(m),
-        )) as AgentRunResult<TSchemaDef>;
-      }
-
-      const text = this.lastAssistantText(session.messages);
-      if (!text.trim()) {
-        throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
-          recoverable: true,
-          agentLabel: options.label,
-        });
-      }
-      return text as AgentRunResult<TSchemaDef>;
-    } finally {
-      removeAbortListener?.();
-      removeHistoryListener?.();
-      try {
-        emitHistory();
-      } catch {
-        // History is diagnostic only; never let it mask the real result/error.
-      }
-      // Read real usage before disposing — dispose tears down the session state.
-      if (options.onUsage) {
-        try {
-          const { tokens, cost } = session.getSessionStats();
-          options.onUsage({
-            input: tokens.input,
-            output: tokens.output,
-            cacheRead: tokens.cacheRead,
-            cacheWrite: tokens.cacheWrite,
-            total: tokens.total,
-            cost,
-          });
-        } catch {
-          // Usage is best-effort; never let stats failure mask the real result/error.
+    // A single create→prompt→resolve→dispose attempt on one model spec. Isolated
+    // so the fallback chain can retry the same prompt on the next model after a
+    // PROVIDER_USAGE_LIMIT; each attempt is fully torn down in its own finally.
+    const runOnce = async (spec: string | undefined, resumeFile?: string): Promise<AgentRunResult<TSchemaDef>> => {
+      // Resolve a requested model spec to a Model object. A given-but-unresolved
+      // spec falls back to the session default (with a warning) rather than failing.
+      let resolvedModel: Model<any> | undefined;
+      if (spec) {
+        resolvedModel = this.resolveModel(spec, options.modelRegistry);
+        if (resolvedModel) {
+          options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
+        } else {
+          console.warn(`[workflow] model "${spec}" not found; using session default`);
+          options.onModelFallback?.(spec);
         }
       }
-      session.dispose();
+
+      // Session lifecycle: reopen a persisted partial turn (resume), else a fresh
+      // file-backed session under sessionDir (checkpointable), else in-memory (today's default).
+      let sessionManager: SessionManager;
+      let reopened = false;
+      if (resumeFile && existsSync(resumeFile)) {
+        sessionManager = SessionManager.open(resumeFile);
+        reopened = true;
+      } else if (options.sessionDir) {
+        mkdirSync(options.sessionDir, { recursive: true });
+        sessionManager = SessionManager.create(runCwd, options.sessionDir);
+      } else {
+        sessionManager = SessionManager.inMemory();
+      }
+      // Defined only for a file-backed session (undefined in-memory) → our "checkpointable" flag.
+      const sessionFile = sessionManager.getSessionFile();
+
+      const { session } = await createAgentSession({
+        cwd: runCwd,
+        agentDir,
+        sessionManager,
+        // Use real SettingsManager to inherit user's default provider/model settings.
+        // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
+        // would fall back to the first available model (e.g. openai-codex) which may
+        // not have valid auth, causing silent empty responses.
+        settingsManager: SettingsManager.create(this.cwd, agentDir),
+        customTools,
+        // Per-run modelRegistry wins over the constructor's shared registry, same
+        // precedence as resolveModel() above.
+        ...(options.modelRegistry || this.sharedRegistry
+          ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
+          : {}),
+        ...this.sessionOptions,
+        // Per-call model wins over any sessionOptions.model.
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+      });
+
+      let removeAbortListener: (() => void) | undefined;
+      let removeHistoryListener: (() => void) | undefined;
+      let lastHistoryEmit = 0;
+      const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
+      const maybeEmitHistory = () => {
+        if (!options.onHistory) return;
+        const now = Date.now();
+        if (now - lastHistoryEmit < 250) return;
+        lastHistoryEmit = now;
+        emitHistory();
+      };
+      let resultValue: AgentRunResult<TSchemaDef>;
+      try {
+        if (options.signal?.aborted) throw new Error("Subagent was aborted");
+        if (options.signal) {
+          const onAbort = () => void session.abort();
+          options.signal.addEventListener("abort", onAbort, { once: true });
+          removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+        }
+        if (options.onHistory) {
+          removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+        }
+
+        // A reopened session already holds the original task + partial work, so ask
+        // the model to continue rather than restating the full prompt.
+        await session.prompt(
+          reopened
+            ? this.buildContinuationPrompt(Boolean(options.schema))
+            : this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)),
+        );
+
+        if (options.signal?.aborted) throw new Error("Subagent was aborted");
+
+        // The SDK buries a provider usage/quota limit in the assistant message rather
+        // than throwing; detect it here (before the schema/empty-text branches) so it
+        // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
+        // (schema path) or a silent empty-output null (non-schema path).
+        throwIfProviderLimit(session.messages, options.label);
+
+        if (options.schema) {
+          resultValue = (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>
+            this.lastAssistantText(m),
+          )) as AgentRunResult<TSchemaDef>;
+        } else {
+          const text = this.lastAssistantText(session.messages);
+          if (!text.trim()) {
+            throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+              recoverable: true,
+              agentLabel: options.label,
+            });
+          }
+          resultValue = text as AgentRunResult<TSchemaDef>;
+        }
+      } catch (err) {
+        // A mid-turn provider limit on a file-backed session: attach the partial
+        // session file so resume() can reopen it and continue this turn instead of
+        // restarting. The file is intentionally NOT deleted here.
+        if (sessionFile && isProviderUsageLimit(err) && !err.partialSessionFile) {
+          throw new WorkflowError(err.message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            agentLabel: options.label,
+            resetHint: err.resetHint,
+            partialSessionFile: sessionFile,
+          });
+        }
+        throw err;
+      } finally {
+        removeAbortListener?.();
+        removeHistoryListener?.();
+        try {
+          emitHistory();
+        } catch {
+          // History is diagnostic only; never let it mask the real result/error.
+        }
+        // Read real usage before disposing — dispose tears down the session state.
+        if (options.onUsage) {
+          try {
+            const { tokens, cost } = session.getSessionStats();
+            options.onUsage({
+              input: tokens.input,
+              output: tokens.output,
+              cacheRead: tokens.cacheRead,
+              cacheWrite: tokens.cacheWrite,
+              total: tokens.total,
+              cost,
+            });
+          } catch {
+            // Usage is best-effort; never let stats failure mask the real result/error.
+          }
+        }
+        session.dispose();
+      }
+      // A completed turn needs no checkpoint: drop its persisted session file.
+      if (sessionFile) {
+        try {
+          unlinkSync(sessionFile);
+        } catch {
+          // Best-effort: the file may not have been written or already removed.
+        }
+      }
+      return resultValue;
+    };
+
+    // Model fallback chain: the primary spec, then each configured fallback. On a
+    // PROVIDER_USAGE_LIMIT retry the same prompt on the next resolvable model before
+    // letting the limit propagate (which pauses the run). Unresolvable fallbacks are
+    // skipped (signalled via onModelFallback), not counted as attempts.
+    // Token note: each failed attempt's usage is overwritten via onUsage by the next;
+    // only the served attempt's usage is recorded upstream (a failed attempt's partial
+    // tokens are not separately summed).
+    const chain: (string | undefined)[] = [modelSpec, ...(options.fallbackModels ?? [])];
+    let lastLimit: unknown;
+    for (let i = 0; i < chain.length; i++) {
+      const spec = chain[i];
+      if (i > 0 && spec) {
+        if (!this.resolveModel(spec, options.modelRegistry)) {
+          options.onModelFallback?.(spec); // unresolvable fallback: skip, not an attempt
+          continue;
+        }
+        options.onModelFallback?.(spec); // signal the degrade so /workflows shows it
+      }
+      try {
+        // Only the first attempt reopens the resume checkpoint; fallbacks run fresh.
+        return await runOnce(spec, i === 0 ? options.resumeSessionFile : undefined);
+      } catch (err) {
+        if (isProviderUsageLimit(err) && i < chain.length - 1) {
+          lastLimit = err;
+          // This attempt's partial checkpoint is superseded by the next model; drop it
+          // so only the final (paused) attempt's file is journaled for resume.
+          if (err.partialSessionFile) {
+            try {
+              unlinkSync(err.partialSessionFile);
+            } catch {
+              // best-effort
+            }
+          }
+          continue;
+        }
+        throw err;
+      }
     }
+    // All candidates hit the limit (or the tail was unresolvable) → propagate the
+    // last PROVIDER_USAGE_LIMIT so the run pauses exactly as before.
+    throw lastLimit;
   }
 
   private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {
@@ -517,18 +630,36 @@ export class WorkflowAgent {
     ].filter(Boolean);
 
     if (structured) {
-      parts.push(
-        [
-          "Final output contract:",
-          "- Your final action MUST be a structured_output tool call.",
-          "- The structured_output arguments are the return value of this subagent.",
-          "- Do not emit a prose final answer instead of structured_output.",
-          "- If you need to inspect files or run commands first, do so, then call structured_output exactly once.",
-        ].join("\n"),
-      );
+      parts.push(this.structuredOutputContract());
     }
 
     return parts.join("\n\n");
+  }
+
+  /**
+   * Prompt for a reopened (checkpointed) session: the original task and its partial
+   * work are already in the reopened history, so ask the model to resume the turn.
+   * Re-appends the structured-output contract when a schema is in force.
+   */
+  private buildContinuationPrompt(structured: boolean): string {
+    const parts = [
+      "Continue the previous task from exactly where it stopped. Do not repeat steps already completed above.",
+    ];
+    if (structured) {
+      parts.push(this.structuredOutputContract());
+    }
+    return parts.join("\n\n");
+  }
+
+  /** The structured-output contract lines appended to schema-agent prompts. */
+  private structuredOutputContract(): string {
+    return [
+      "Final output contract:",
+      "- Your final action MUST be a structured_output tool call.",
+      "- The structured_output arguments are the return value of this subagent.",
+      "- Do not emit a prose final answer instead of structured_output.",
+      "- If you need to inspect files or run commands first, do so, then call structured_output exactly once.",
+    ].join("\n");
   }
 
   private lastAssistantText(messages: unknown[]): string {
