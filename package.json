@@ -50,13 +50,11 @@
     "llm"
   ],
   "pi": {
-    "extensions": [
-      "extensions/workflow.ts"
-    ]
+    "extensions": ["extensions/index.ts"]
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/QuintinShaw/pi-dynamic-workflows.git"
+    "url": "git+https://github.com/quantmind-br/pi-dynamic-workflows.git"
   },
   "author": "QuintinShaw",
   "contributors": [
